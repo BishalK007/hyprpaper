@@ -20,6 +20,20 @@ CHyprpaper::CHyprpaper() {
     setMallocThreshold();
 }
 
+static inline double quantizedScale(double s) {
+    return std::round(s * 120.0) / 120.0;
+}
+
+static inline double currentSurfaceScale(const SMonitor* m) {
+    if (m->pCurrentLayerSurface && m->pCurrentLayerSurface->pFractionalScaleInfo)
+        return m->pCurrentLayerSurface->fScale;
+    return m->scale;
+}
+
+static inline Vector2D logicalSize(const SMonitor* m) {
+    return Vector2D{std::round(m->size.x), std::round(m->size.y)};
+}
+
 static void handleGlobal(CCWlRegistry* registry, uint32_t name, const char* interface, uint32_t version) {
     if (strcmp(interface, wl_compositor_interface.name) == 0) {
         g_pHyprpaper->m_pCompositor = makeShared<CCWlCompositor>((wl_proxy*)wl_registry_bind((wl_registry*)registry->resource(), name, &wl_compositor_interface, 4));
@@ -236,7 +250,10 @@ void CHyprpaper::recheckMonitor(SMonitor* pMonitor) {
         pMonitor->pCurrentLayerSurface->pLayerSurface->sendAckConfigure(pMonitor->configureSerial);
     }
 
-    if (pMonitor->wantsReload) {
+    if (!pMonitor->pCurrentLayerSurface && pMonitor->readyForLS && pMonitor->hasATarget)
+        createLSForMonitor(pMonitor);
+
+    if (pMonitor->wantsReload && pMonitor->initialized) {
         pMonitor->wantsReload = false;
         renderWallpaperForMonitor(pMonitor);
     }
@@ -295,15 +312,17 @@ void CHyprpaper::ensurePoolBuffersPresent() {
                 continue;
 
             auto it = std::find_if(m_vBuffers.begin(), m_vBuffers.end(), [wt = &wt, &m](const std::unique_ptr<SPoolBuffer>& el) {
-                auto scale = std::round((m->pCurrentLayerSurface && m->pCurrentLayerSurface->pFractionalScaleInfo ? m->pCurrentLayerSurface->fScale : m->scale) * 120.0) / 120.0;
-                return el->target == wt->m_szPath && vectorDeltaLessThan(el->pixelSize, m->size * scale, 1);
+                const double   S = quantizedScale(currentSurfaceScale(m.get()));
+                const Vector2D B = logicalSize(m.get()) * S;
+                return el->target == wt->m_szPath && vectorDeltaLessThan(el->pixelSize, B, 1);
             });
 
             if (it == m_vBuffers.end()) {
                 // create
-                const auto PBUFFER = m_vBuffers.emplace_back(std::make_unique<SPoolBuffer>()).get();
-                auto scale = std::round((m->pCurrentLayerSurface && m->pCurrentLayerSurface->pFractionalScaleInfo ? m->pCurrentLayerSurface->fScale : m->scale) * 120.0) / 120.0;
-                createBuffer(PBUFFER, m->size.x * scale, m->size.y * scale, WL_SHM_FORMAT_ARGB8888);
+                const auto     PBUFFER = m_vBuffers.emplace_back(std::make_unique<SPoolBuffer>()).get();
+                const double   S       = quantizedScale(currentSurfaceScale(m.get()));
+                const Vector2D B       = logicalSize(m.get()) * S;
+                createBuffer(PBUFFER, (int)B.x, (int)B.y, WL_SHM_FORMAT_ARGB8888);
 
                 PBUFFER->target = wt.m_szPath;
 
@@ -507,11 +526,9 @@ void CHyprpaper::destroyBuffer(SPoolBuffer* pBuffer) {
 
 SPoolBuffer* CHyprpaper::getPoolBuffer(SMonitor* pMonitor, CWallpaperTarget* pWallpaperTarget) {
     const auto IT = std::find_if(m_vBuffers.begin(), m_vBuffers.end(), [&](const std::unique_ptr<SPoolBuffer>& el) {
-        auto scale =
-            std::round((pMonitor->pCurrentLayerSurface && pMonitor->pCurrentLayerSurface->pFractionalScaleInfo ? pMonitor->pCurrentLayerSurface->fScale : pMonitor->scale) *
-                       120.0) /
-            120.0;
-        return el->target == pWallpaperTarget->m_szPath && vectorDeltaLessThan(el->pixelSize, pMonitor->size * scale, 1);
+        const double   S = quantizedScale(currentSurfaceScale(pMonitor));
+        const Vector2D B = logicalSize(pMonitor) * S;
+        return el->target == pWallpaperTarget->m_szPath && vectorDeltaLessThan(el->pixelSize, B, 1);
     });
 
     if (IT == m_vBuffers.end())
@@ -549,8 +566,10 @@ void CHyprpaper::renderWallpaperForMonitor(SMonitor* pMonitor) {
         }
     }
 
-    const double   SURFACESCALE = pMonitor->pCurrentLayerSurface && pMonitor->pCurrentLayerSurface->pFractionalScaleInfo ? pMonitor->pCurrentLayerSurface->fScale : pMonitor->scale;
-    const Vector2D DIMENSIONS   = Vector2D{std::round(pMonitor->size.x * SURFACESCALE), std::round(pMonitor->size.y * SURFACESCALE)};
+    // Compute logical and buffer sizes
+    const double   S = quantizedScale(currentSurfaceScale(pMonitor));
+    const Vector2D L = logicalSize(pMonitor);
+    const Vector2D B = Vector2D{std::round(L.x * S), std::round(L.y * S)};
 
     const auto     PCAIRO = PBUFFER->cairo;
     cairo_save(PCAIRO);
@@ -560,37 +579,40 @@ void CHyprpaper::renderWallpaperForMonitor(SMonitor* pMonitor) {
 
     // always draw a black background behind the wallpaper
     cairo_set_source_rgb(PCAIRO, 0, 0, 0);
-    cairo_rectangle(PCAIRO, 0, 0, DIMENSIONS.x, DIMENSIONS.y);
+    cairo_rectangle(PCAIRO, 0, 0, B.x, B.y);
     cairo_fill(PCAIRO);
     cairo_surface_flush(PBUFFER->surface);
 
-    // get scale
-    // we always do cover
-    double     scale;
-    Vector2D   origin;
+    cairo_save(PCAIRO);
+    cairo_scale(PCAIRO, S, S);
 
-    const bool LOWASPECTRATIO = pMonitor->size.x / pMonitor->size.y > PWALLPAPERTARGET->m_vSize.x / PWALLPAPERTARGET->m_vSize.y;
-    if ((CONTAIN && !LOWASPECTRATIO) || (!CONTAIN && LOWASPECTRATIO)) {
-        scale    = DIMENSIONS.x / PWALLPAPERTARGET->m_vSize.x;
-        origin.y = -(PWALLPAPERTARGET->m_vSize.y * scale - DIMENSIONS.y) / 2.0 / scale;
+    // cover/contain in logical units
+    const double imgW      = PWALLPAPERTARGET->m_vSize.x;
+    const double imgH      = PWALLPAPERTARGET->m_vSize.y;
+    const bool   lowAspect = (L.x / L.y) > (imgW / imgH);
+    double       scaleL;
+    Vector2D     originL{0.0, 0.0};
+
+    if ((CONTAIN && !lowAspect) || (!CONTAIN && lowAspect)) {
+        scaleL    = L.x / imgW;
+        originL.y = -(imgH * scaleL - L.y) / (2.0 * scaleL);
     } else {
-        scale    = DIMENSIONS.y / PWALLPAPERTARGET->m_vSize.y;
-        origin.x = -(PWALLPAPERTARGET->m_vSize.x * scale - DIMENSIONS.x) / 2.0 / scale;
+        scaleL    = L.y / imgH;
+        originL.x = -(imgW * scaleL - L.x) / (2.0 * scaleL);
     }
-
-    Debug::log(LOG, "Image data for {}: {} at [{:.2f}, {:.2f}], scale: {:.2f} (original image size: [{}, {}])", pMonitor->name, PWALLPAPERTARGET->m_szPath, origin.x, origin.y,
-               scale, (int)PWALLPAPERTARGET->m_vSize.x, (int)PWALLPAPERTARGET->m_vSize.y);
 
     if (TILE) {
         cairo_pattern_t* pattern = cairo_pattern_create_for_surface(PWALLPAPERTARGET->m_pCairoSurface->cairo());
         cairo_pattern_set_extend(pattern, CAIRO_EXTEND_REPEAT);
         cairo_set_source(PCAIRO, pattern);
+        cairo_rectangle(PCAIRO, 0, 0, L.x, L.y);
+        cairo_fill(PCAIRO);
+        cairo_pattern_destroy(pattern);
     } else {
-        cairo_scale(PCAIRO, scale, scale);
-        cairo_set_source_surface(PCAIRO, PWALLPAPERTARGET->m_pCairoSurface->cairo(), origin.x, origin.y);
+        cairo_scale(PCAIRO, scaleL, scaleL);
+        cairo_set_source_surface(PCAIRO, PWALLPAPERTARGET->m_pCairoSurface->cairo(), originL.x, originL.y);
+        cairo_paint(PCAIRO);
     }
-
-    cairo_paint(PCAIRO);
 
     if (*PRENDERSPLASH && getenv("HYPRLAND_INSTANCE_SIGNATURE")) {
         auto SPLASH = execAndGet("hyprctl splash");
@@ -601,7 +623,7 @@ void CHyprpaper::renderWallpaperForMonitor(SMonitor* pMonitor) {
 
         cairo_select_font_face(PCAIRO, "Sans", CAIRO_FONT_SLANT_NORMAL, CAIRO_FONT_WEIGHT_NORMAL);
 
-        const auto FONTSIZE = (int)(DIMENSIONS.y / 76.0 / scale);
+        const int FONTSIZE = (int)(L.y / 76.0);
         cairo_set_font_size(PCAIRO, FONTSIZE);
 
         static auto PSPLASHCOLOR = Hyprlang::CSimpleConfigValue<Hyprlang::INT>(g_pConfigManager->config.get(), "splash_color");
@@ -614,33 +636,36 @@ void CHyprpaper::renderWallpaperForMonitor(SMonitor* pMonitor) {
         cairo_text_extents_t textExtents;
         cairo_text_extents(PCAIRO, SPLASH.c_str(), &textExtents);
 
-        cairo_move_to(PCAIRO, ((DIMENSIONS.x - textExtents.width * scale) / 2.0) / scale, ((DIMENSIONS.y * (100 - *PSPLASHOFFSET)) / 100 - textExtents.height * scale) / scale);
+        const double TX = (L.x - textExtents.width) / 2.0;
+        const double TY = ((L.y * (100 - *PSPLASHOFFSET)) / 100.0 - textExtents.height);
+        cairo_move_to(PCAIRO, TX, TY);
 
-        Debug::log(LOG, "Splash font size: {}, pos: {:.2f}, {:.2f}", FONTSIZE, (DIMENSIONS.x - textExtents.width) / 2.0 / scale,
-                   ((DIMENSIONS.y * (100 - *PSPLASHOFFSET)) / 100 - textExtents.height * scale) / scale);
+        Debug::log(LOG, "Splash font size: {}, pos: {:.2f}, {:.2f}", FONTSIZE, TX, TY);
 
         cairo_show_text(PCAIRO, SPLASH.c_str());
-
-        cairo_surface_flush(PWALLPAPERTARGET->m_pCairoSurface->cairo());
     }
 
     cairo_restore(PCAIRO);
 
     if (pMonitor->pCurrentLayerSurface) {
-        pMonitor->pCurrentLayerSurface->pSurface->sendAttach(PBUFFER->buffer.get(), 0, 0);
-        pMonitor->pCurrentLayerSurface->pSurface->sendSetBufferScale(pMonitor->pCurrentLayerSurface->pFractionalScaleInfo ? 1 : pMonitor->scale);
-        pMonitor->pCurrentLayerSurface->pSurface->sendDamageBuffer(0, 0, 0xFFFF, 0xFFFF);
+        const int DEST_W = (int)L.x;
+        const int DEST_H = (int)L.y;
 
-        // our wps are always opaque
-        auto opaqueRegion = makeShared<CCWlRegion>(g_pHyprpaper->m_pCompositor->sendCreateRegion());
-        opaqueRegion->sendAdd(0, 0, PBUFFER->pixelSize.x, PBUFFER->pixelSize.y);
-        pMonitor->pCurrentLayerSurface->pSurface->sendSetOpaqueRegion(opaqueRegion.get());
+        pMonitor->pCurrentLayerSurface->pSurface->sendSetBufferScale(pMonitor->pCurrentLayerSurface->pFractionalScaleInfo ? 1 : (int)std::round(S));
 
         if (pMonitor->pCurrentLayerSurface->pFractionalScaleInfo) {
-            Debug::log(LOG, "Submitting viewport dest size {}x{} for {:x}", static_cast<int>(std::round(pMonitor->size.x)), static_cast<int>(std::round(pMonitor->size.y)),
-                       (uintptr_t)pMonitor->pCurrentLayerSurface);
-            pMonitor->pCurrentLayerSurface->pViewport->sendSetDestination(static_cast<int>(std::round(pMonitor->size.x)), static_cast<int>(std::round(pMonitor->size.y)));
+            pMonitor->pCurrentLayerSurface->pViewport->sendSetSource(wl_fixed_from_double(0.0), wl_fixed_from_double(0.0), wl_fixed_from_double(PBUFFER->pixelSize.x),
+                                                                     wl_fixed_from_double(PBUFFER->pixelSize.y));
+            pMonitor->pCurrentLayerSurface->pViewport->sendSetDestination(DEST_W, DEST_H);
         }
+
+        pMonitor->pCurrentLayerSurface->pSurface->sendAttach(PBUFFER->buffer.get(), 0, 0);
+        pMonitor->pCurrentLayerSurface->pSurface->sendDamageBuffer(0, 0, (int)PBUFFER->pixelSize.x, (int)PBUFFER->pixelSize.y);
+
+        auto opaqueRegion = makeShared<CCWlRegion>(g_pHyprpaper->m_pCompositor->sendCreateRegion());
+        opaqueRegion->sendAdd(0, 0, DEST_W, DEST_H);
+        pMonitor->pCurrentLayerSurface->pSurface->sendSetOpaqueRegion(opaqueRegion.get());
+
         pMonitor->pCurrentLayerSurface->pSurface->sendCommit();
     }
 

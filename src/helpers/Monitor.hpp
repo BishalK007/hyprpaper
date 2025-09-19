@@ -11,6 +11,7 @@ struct SMonitor {
     SP<CCWlOutput>                              output;
     uint32_t                                    wayland_name = 0;
     Vector2D                                    size;
+    Vector2D                                    modeSize;
     int                                         scale;
     wl_output_transform                         transform = WL_OUTPUT_TRANSFORM_NORMAL;
 

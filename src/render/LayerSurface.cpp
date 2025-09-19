@@ -41,7 +41,7 @@ CLayerSurface::CLayerSurface(SMonitor* pMonitor) {
         m_pMonitor->wantsACK        = true;
         m_pMonitor->initialized     = true;
 
-        Debug::log(LOG, "configure for {}", m_pMonitor->name);
+        Debug::log(LOG, "configure for {} at {}x{}", m_pMonitor->name, (int)x, (int)y);
     });
 
     pLayerSurface->setClosed([this](CCZwlrLayerSurfaceV1* r) {
